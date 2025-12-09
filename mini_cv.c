@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MINI_NO_THREAD_UNSAFE_POOL 1
+
 struct mini_decimate_alpha {
     int si;
     int di;
