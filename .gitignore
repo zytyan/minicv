@@ -5,3 +5,7 @@ __pycache__/
 *.so
 *.o
 *.pyc
+mini.prof*
+perf.data
+perf.out
+perf.folded

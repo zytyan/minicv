@@ -11,6 +11,8 @@ import os
 import random
 import subprocess
 import sys
+import shutil
+from pathlib import Path
 from time import perf_counter
 from typing import Tuple
 
@@ -19,26 +21,72 @@ import numpy as np
 
 ROOT = os.path.abspath(os.path.dirname(__file__))
 LIB_PATH = os.path.join(ROOT, "libmini_cv.so")
+PROF_RAW = os.path.join(ROOT, "mini.profraw")
+PROF_DATA = os.path.join(ROOT, "mini.profdata")
 
 
 def build_shared_lib() -> None:
-    if os.path.exists(LIB_PATH):
-        return
-    cmd = [
-        "gcc",
-        "-O2",
-        "-g",
-        "-fno-omit-frame-pointer",
-        "-std=c99",
-        "-shared",
-        "-fPIC",
-        os.path.join(ROOT, "mini_cv.c"),
-        "-o",
-        LIB_PATH,
-        "-lm",
-        "-lunwind",
-    ]
-    subprocess.check_call(cmd, cwd=ROOT)
+    clang = shutil.which("clang")
+    if not clang:
+        raise RuntimeError("clang not found; install clang to use LTO/PGO build.")
+
+    src = os.path.join(ROOT, "mini_cv.c")
+    need_profile = (
+        not os.path.exists(PROF_DATA)
+        or os.path.getmtime(PROF_DATA) < os.path.getmtime(src)
+    )
+
+    def compile_obj(output: str, extra: list[str]) -> None:
+        cmd = [
+            clang,
+            "-O2",
+            "-g",
+            "-fno-omit-frame-pointer",
+            "-flto",
+            "-std=c99",
+            "-shared",
+            "-fPIC",
+            os.path.join(ROOT, "mini_cv.c"),
+            "-o",
+            output,
+            "-lm",
+            "-lunwind",
+        ] + extra
+        subprocess.check_call(cmd, cwd=ROOT)
+
+    if need_profile:
+        # Build instrumented binary
+        compile_obj(
+            LIB_PATH,
+            [f"-fprofile-instr-generate={PROF_RAW}", "-fcoverage-mapping"],
+        )
+        # Run a small workload to collect profiles
+        env = os.environ.copy()
+        env["LLVM_PROFILE_FILE"] = PROF_RAW
+        profile_script = f"""
+import ctypes, numpy as np
+lib = ctypes.CDLL(r\"{LIB_PATH}\")
+lib.mini_resize_area_u8.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+lib.mini_resize_area_u8.restype = ctypes.c_int
+lib.mini_cvtcolor_u8.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+lib.mini_cvtcolor_u8.restype = ctypes.c_int
+src = np.random.randint(0, 256, (240, 320, 3), dtype=np.uint8)
+dst = np.empty((120, 160, 3), dtype=np.uint8)
+gray = np.empty((120, 160), dtype=np.uint8)
+for _ in range(50):
+    lib.mini_resize_area_u8(src.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 320, 240, src.strides[0], 3, dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 160, 120, dst.strides[0])
+    lib.mini_cvtcolor_u8(dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 160, 120, dst.strides[0], 3, gray.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), gray.strides[0], 1, 0)
+"""
+        subprocess.check_call([sys.executable, "-c", profile_script], env=env, cwd=ROOT)
+        subprocess.check_call(
+            ["llvm-profdata", "merge", "-output", PROF_DATA, PROF_RAW], cwd=ROOT
+        )
+
+    # Final optimized build with PGO + LTO
+    extra = []
+    if os.path.exists(PROF_DATA):
+        extra.append(f"-fprofile-instr-use={PROF_DATA}")
+    compile_obj(LIB_PATH, extra)
 
 
 class MiniColor(enum.IntEnum):

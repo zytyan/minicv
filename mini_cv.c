@@ -4,14 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Thread-local buffer pool to reduce malloc/free while keeping thread safety.
-#undef MINI_NO_THREAD_UNSAFE_POOL
-
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#define MINI_THREAD_LOCAL _Thread_local
-#else
-#define MINI_THREAD_LOCAL __thread
-#endif
+// Disable buffer pools: allocation overhead is negligible vs arithmetic hot paths.
+#define MINI_NO_THREAD_UNSAFE_POOL 1
 
 struct mini_decimate_alpha {
     int si;
@@ -21,7 +15,7 @@ struct mini_decimate_alpha {
 
 #ifndef MINI_NO_THREAD_UNSAFE_POOL
 // Simple thread-local buffer pool to reduce repeated malloc/free overhead in hot paths.
-// Disable by defining MINI_NO_THREAD_UNSAFE_POOL.
+// Disabled by default (see MINI_NO_THREAD_UNSAFE_POOL).
 struct mini_buffer_pool {
     struct mini_decimate_alpha* xtab;
     int xtab_cap;
@@ -41,7 +35,7 @@ struct mini_buffer_pool {
     int* lin_yofs;
     int lin_yofs_cap;
 };
-static MINI_THREAD_LOCAL struct mini_buffer_pool mini_pool = {0};
+static struct mini_buffer_pool mini_pool = {0};
 
 static void* mini_ensure(void* ptr, int* cap, int need, size_t elem_size)
 {
