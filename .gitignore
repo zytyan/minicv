@@ -1,0 +1,7 @@
+.venv/
+opencv-4.10.0/
+opencv-4.10.0.zip
+__pycache__/
+*.so
+*.o
+*.pyc
