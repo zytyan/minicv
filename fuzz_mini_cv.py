@@ -26,7 +26,10 @@ def build_shared_lib() -> None:
         return
     cmd = [
         "gcc",
-        "-O2",
+        "-O3",
+        "-flto",
+        "-march=native",
+        "-fno-plt",
         "-std=c99",
         "-shared",
         "-fPIC",

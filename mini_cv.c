@@ -4,6 +4,52 @@
 #include <stdlib.h>
 #include <string.h>
 
+struct mini_decimate_alpha {
+    int si;
+    int di;
+    float alpha;
+};
+
+#ifndef MINI_NO_THREAD_UNSAFE_POOL
+// Simple thread-unsafe buffer pool to reduce repeated malloc/free overhead in hot paths.
+// Disable by defining MINI_NO_THREAD_UNSAFE_POOL.
+struct mini_buffer_pool {
+    struct mini_decimate_alpha* xtab;
+    int xtab_cap;
+    struct mini_decimate_alpha* ytab;
+    int ytab_cap;
+    int* tabofs;
+    int tabofs_cap;
+    float* float_buf;
+    int float_buf_cap;
+
+    int* lin_alpha;
+    int lin_alpha_cap;
+    int* lin_beta;
+    int lin_beta_cap;
+    int* lin_xofs;
+    int lin_xofs_cap;
+    int* lin_yofs;
+    int lin_yofs_cap;
+};
+static struct mini_buffer_pool mini_pool = {0};
+
+static void* mini_ensure(void* ptr, int* cap, int need, size_t elem_size)
+{
+    if (need <= *cap)
+        return ptr;
+    int new_cap = (*cap == 0) ? need : *cap;
+    while (new_cap < need) {
+        new_cap = new_cap < (1 << 20) ? new_cap * 2 : new_cap + need;
+    }
+    void* nptr = realloc(ptr, (size_t)new_cap * elem_size);
+    if (!nptr)
+        return NULL;
+    *cap = new_cap;
+    return nptr;
+}
+#endif
+
 #define MINI_GRAY_SHIFT 15
 #define MINI_RY15 9798   /* R2YF * 32768 + 0.5 */
 #define MINI_GY15 19235  /* G2YF * 32768 + 0.5 */
@@ -19,12 +65,6 @@ static inline uint8_t mini_saturate_from_float(float v) {
     int iv = (int)lroundf(v);
     return mini_saturate_u8(iv);
 }
-
-struct mini_decimate_alpha {
-    int si;
-    int di;
-    float alpha;
-};
 
 static int mini_compute_resize_area_tab(int ssize, int dsize, int cn, double scale,
                                         struct mini_decimate_alpha* tab) {
@@ -67,29 +107,93 @@ static int mini_compute_resize_area_tab(int ssize, int dsize, int cn, double sca
     return k;
 }
 
+static int mini_resize_area_fast_int(const uint8_t* src, int src_w, int src_h, int src_stride,
+                                     int cn, uint8_t* dst, int dst_w, int dst_h, int dst_stride,
+                                     int iscale_x, int iscale_y) {
+    int area = iscale_x * iscale_y;
+    int area_half = area >> 1;
+    if (iscale_x == 2 && iscale_y == 2) {
+        for (int dy = 0; dy < dst_h; ++dy) {
+            const uint8_t* s0 = src + (dy * 2) * src_stride;
+            const uint8_t* s1 = s0 + src_stride;
+            uint8_t* drow = dst + dy * dst_stride;
+            for (int dx = 0; dx < dst_w; ++dx) {
+                const uint8_t* p0 = s0 + dx * 2 * cn;
+                const uint8_t* p1 = s1 + dx * 2 * cn;
+                for (int c = 0; c < cn; ++c) {
+                    int sum = p0[c] + p0[c + cn] + p1[c] + p1[c + cn];
+                    drow[dx * cn + c] = (uint8_t)((sum + 2) >> 2);
+                }
+            }
+        }
+        return 0;
+    }
+    for (int dy = 0; dy < dst_h; ++dy) {
+        int sy0 = dy * iscale_y;
+        const uint8_t* srow0 = src + sy0 * src_stride;
+        uint8_t* drow = dst + dy * dst_stride;
+        for (int dx = 0; dx < dst_w; ++dx) {
+            int sx0 = dx * iscale_x * cn;
+            for (int c = 0; c < cn; ++c) {
+                int sum = 0;
+                for (int ky = 0; ky < iscale_y; ++ky) {
+                    const uint8_t* srow = srow0 + ky * src_stride;
+                    const uint8_t* sp = srow + sx0 + c;
+                    for (int kx = 0; kx < iscale_x; ++kx) {
+                        sum += sp[kx * cn];
+                    }
+                }
+                drow[dx * cn + c] = (uint8_t)((sum + area_half) / area);
+            }
+        }
+    }
+    return 0;
+}
+
 static int mini_resize_area_down(const uint8_t* src, int src_w, int src_h, int src_stride,
                                  int cn, uint8_t* dst, int dst_w, int dst_h, int dst_stride) {
     double scale_x = (double)src_w / (double)dst_w;
     double scale_y = (double)src_h / (double)dst_h;
 
+    int iscale_x = (int)lround(scale_x);
+    int iscale_y = (int)lround(scale_y);
+    if (fabs(scale_x - (double)iscale_x) < 1e-6 && fabs(scale_y - (double)iscale_y) < 1e-6) {
+        // Integer scale fast-path (closest to OpenCV's area_fast path).
+        return mini_resize_area_fast_int(src, src_w, src_h, src_stride, cn, dst, dst_w, dst_h,
+                                         dst_stride, iscale_x, iscale_y);
+    }
+
     int xtab_capacity = src_w * 2 + 2;
     int ytab_capacity = src_h * 2 + 2;
+#ifdef MINI_NO_THREAD_UNSAFE_POOL
     struct mini_decimate_alpha* xtab =
         (struct mini_decimate_alpha*)malloc(sizeof(struct mini_decimate_alpha) * xtab_capacity);
     struct mini_decimate_alpha* ytab =
         (struct mini_decimate_alpha*)malloc(sizeof(struct mini_decimate_alpha) * ytab_capacity);
     int* tabofs = (int*)malloc(sizeof(int) * (dst_h + 1));
-    float* sum = (float*)malloc(sizeof(float) * dst_w * cn);
-    float* buf = (float*)malloc(sizeof(float) * dst_w * cn);
-
-    if (!xtab || !ytab || !tabofs || !sum || !buf) {
+    float* float_buf = (float*)malloc(sizeof(float) * dst_w * cn * 2);
+    if (!xtab || !ytab || !tabofs || !float_buf) {
         free(xtab);
         free(ytab);
         free(tabofs);
-        free(sum);
-        free(buf);
+        free(float_buf);
         return -1;
     }
+    float* buf = float_buf;
+    float* sum = float_buf + dst_w * cn;
+#else
+    mini_pool.xtab = (struct mini_decimate_alpha*)mini_ensure(mini_pool.xtab, &mini_pool.xtab_cap, xtab_capacity, sizeof(struct mini_decimate_alpha));
+    mini_pool.ytab = (struct mini_decimate_alpha*)mini_ensure(mini_pool.ytab, &mini_pool.ytab_cap, ytab_capacity, sizeof(struct mini_decimate_alpha));
+    mini_pool.tabofs = (int*)mini_ensure(mini_pool.tabofs, &mini_pool.tabofs_cap, dst_h + 1, sizeof(int));
+    mini_pool.float_buf = (float*)mini_ensure(mini_pool.float_buf, &mini_pool.float_buf_cap, dst_w * cn * 2, sizeof(float));
+    if (!mini_pool.xtab || !mini_pool.ytab || !mini_pool.tabofs || !mini_pool.float_buf)
+        return -1;
+    struct mini_decimate_alpha* xtab = mini_pool.xtab;
+    struct mini_decimate_alpha* ytab = mini_pool.ytab;
+    int* tabofs = mini_pool.tabofs;
+    float* buf = mini_pool.float_buf;
+    float* sum = mini_pool.float_buf + dst_w * cn;
+#endif
 
     int xtab_size = mini_compute_resize_area_tab(src_w, dst_w, cn, scale_x, xtab);
     int ytab_size = mini_compute_resize_area_tab(src_h, dst_h, 1, scale_y, ytab);
@@ -134,11 +238,12 @@ static int mini_resize_area_down(const uint8_t* src, int src_w, int src_h, int s
         }
     }
 
+#ifdef MINI_NO_THREAD_UNSAFE_POOL
     free(xtab);
     free(ytab);
     free(tabofs);
-    free(sum);
-    free(buf);
+    free(float_buf);
+#endif
     return 0;
 }
 
@@ -151,6 +256,7 @@ static int mini_resize_area_linear(const uint8_t* src, int src_w, int src_h, int
     double inv_scale_x = 1.0 / scale_x;
     double inv_scale_y = 1.0 / scale_y;
     int width = dst_w * cn;
+#ifdef MINI_NO_THREAD_UNSAFE_POOL
     int* alpha = (int*)malloc(sizeof(int) * width * 2);
     int* beta = (int*)malloc(sizeof(int) * dst_h * 2);
     int* xofs = (int*)malloc(sizeof(int) * width);
@@ -162,6 +268,18 @@ static int mini_resize_area_linear(const uint8_t* src, int src_w, int src_h, int
         free(yofs);
         return -1;
     }
+#else
+    mini_pool.lin_alpha = (int*)mini_ensure(mini_pool.lin_alpha, &mini_pool.lin_alpha_cap, width * 2, sizeof(int));
+    mini_pool.lin_beta = (int*)mini_ensure(mini_pool.lin_beta, &mini_pool.lin_beta_cap, dst_h * 2, sizeof(int));
+    mini_pool.lin_xofs = (int*)mini_ensure(mini_pool.lin_xofs, &mini_pool.lin_xofs_cap, width, sizeof(int));
+    mini_pool.lin_yofs = (int*)mini_ensure(mini_pool.lin_yofs, &mini_pool.lin_yofs_cap, dst_h, sizeof(int));
+    if (!mini_pool.lin_alpha || !mini_pool.lin_beta || !mini_pool.lin_xofs || !mini_pool.lin_yofs)
+        return -1;
+    int* alpha = mini_pool.lin_alpha;
+    int* beta = mini_pool.lin_beta;
+    int* xofs = mini_pool.lin_xofs;
+    int* yofs = mini_pool.lin_yofs;
+#endif
 
     for (int dx = 0; dx < dst_w; ++dx) {
         int sx = (int)floor(dx * scale_x);
@@ -235,10 +353,12 @@ static int mini_resize_area_linear(const uint8_t* src, int src_w, int src_h, int
         }
     }
 
+#ifdef MINI_NO_THREAD_UNSAFE_POOL
     free(alpha);
     free(beta);
     free(xofs);
     free(yofs);
+#endif
     return 0;
 }
 
