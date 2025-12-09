@@ -36,6 +36,7 @@ def build_shared_lib() -> None:
         "-o",
         LIB_PATH,
         "-lm",
+        "-lunwind",
     ]
     subprocess.check_call(cmd, cwd=ROOT)
 
