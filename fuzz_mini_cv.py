@@ -237,6 +237,7 @@ def fuzz_resize(iterations: int) -> int:
                 file=sys.stderr,
             )
     # Performance: keep within 10x of OpenCV.
+    print(f"{mini_time=} {cv_time=}")
     if cv_time > 0 and mini_time > cv_time * 10:
         print(
             f"[perf] mini resize slower than OpenCV by {mini_time / cv_time:.2f}x "
